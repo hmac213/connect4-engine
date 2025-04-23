@@ -4,6 +4,8 @@ from model import Connect4NN
 from mcts import MCTSNode, MCTS
 import os
 import tensorflow as tf
+from datetime import datetime
+import json
 
 # TODO: Create random state generation for varied starting states: pick a piece count randomly (0 - 42?) and make moves until the piece count is reached. If the game is over, undo the move and make another until a move cannot be made.
 
@@ -36,11 +38,10 @@ def self_play(mcts, tau, num_games=100):
             else:
                 col = np.random.choice(len(policy), p=policy)
 
-            player_turn = state.turn  # Track the current player
+            player_turn = state.turn
             state = state.place_piece(col, player_turn)
             state.print_board()
             
-            # Record the board state, policy, and the player who made the move
             game_history.append((state.get_board(), policy, player_turn))
 
         outcome = state.get_result()
@@ -53,11 +54,11 @@ def self_play(mcts, tau, num_games=100):
             draws += 1
 
         for board_state, policy, player in game_history:
-            if outcome == 1:  # Red wins
+            if outcome == 1:
                 value = 1 if player == 1 else -1
-            elif outcome == 2:  # Yellow wins
+            elif outcome == 2:
                 value = -1 if player == 1 else 1
-            else:  # Draw
+            else:
                 value = 0
             
             flipped_board_state = np.flip(board_state, axis=1)
@@ -67,60 +68,157 @@ def self_play(mcts, tau, num_games=100):
             training_data.append((flipped_board_state, flipped_policy, value))
 
     print(f"Red wins: {red_wins}, Yellow wins: {yellow_wins}, Draws: {draws}")
-    return training_data
+    return training_data, {"red_wins": red_wins, "yellow_wins": yellow_wins, "draws": draws}
 
 def prepare_training_data(training_data):
     states = []
     policies = []
     values = []
 
-    for board_state, policy, outcome in training_data:
-        states.append(board_state)
+    for board_state, policy, player in training_data:
+        # Create 3-channel input representation
+        red_channel = (board_state == 1).astype(float)
+        yellow_channel = (board_state == 2).astype(float)
+        current_player_channel = np.ones_like(board_state) * (1 if player == 1 else 0)
+        
+        # Stack channels
+        state = np.stack([red_channel, yellow_channel, current_player_channel], axis=-1)
+        
+        states.append(state)
         policies.append(policy)
-        values.append(outcome)
+        values.append(player)
 
-    states = np.array(states).reshape(-1, 6, 7, 1)  # Reshape for the neural network
+    states = np.array(states)
     policies = np.array(policies)
-    values = np.array(values).reshape(-1, 1)  # Reshape to match the output layer
+    values = np.array(values).reshape(-1, 1)
 
     return states, policies, values
 
-def train_neural_network(model, states, policies, values, batch_size=64, epochs=10):
-    model.fit(
+def evaluate_model(model, mcts, num_games=50):
+    """Evaluate the model by playing games against itself"""
+    results = []
+    for _ in range(num_games):
+        state = Connect4()
+        while not state.game_over():
+            # Prepare input for model
+            board_state = state.get_board()
+            red_channel = (board_state == 1).astype(float)
+            yellow_channel = (board_state == 2).astype(float)
+            current_player_channel = np.ones_like(board_state) * (1 if state.turn == 1 else 0)
+            model_input = np.stack([red_channel, yellow_channel, current_player_channel], axis=-1)
+            model_input = np.expand_dims(model_input, axis=0)
+            
+            policy = mcts.search(state, temp=0)  # Use temp=0 for evaluation
+            col = np.argmax(policy)
+            state = state.place_piece(col, state.turn)
+        results.append(state.get_result())
+    
+    red_wins = results.count(1)
+    yellow_wins = results.count(2)
+    draws = results.count(3)
+    
+    return {
+        "red_wins": red_wins,
+        "yellow_wins": yellow_wins,
+        "draws": draws,
+        "win_rate": (red_wins + yellow_wins) / num_games
+    }
+
+def train_neural_network(model, states, policies, values, batch_size=64, epochs=10, validation_split=0.1):
+    # Create TensorBoard callback
+    log_dir = f"logs/fit/{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    tensorboard_callback = tf.keras.callbacks.TensorBoard(
+        log_dir=log_dir,
+        histogram_freq=1,
+        write_graph=True,
+        write_images=True
+    )
+
+    # Create early stopping callback
+    early_stopping = tf.keras.callbacks.EarlyStopping(
+        monitor='val_loss',
+        patience=3,
+        restore_best_weights=True
+    )
+
+    # Create model checkpoint callback
+    checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
+        filepath='best_model.keras',
+        monitor='val_loss',
+        save_best_only=True,
+        save_weights_only=False
+    )
+
+    history = model.fit(
         x=states,
         y={'policy_output': policies, 'value_output': values},
         batch_size=batch_size,
-        epochs=epochs
+        epochs=epochs,
+        validation_split=validation_split,
+        callbacks=[tensorboard_callback, early_stopping, checkpoint_callback]
     )
 
-initial_tau = 2
-final_tau = 0.5
+    return history
 
-for iteration in range(10):
-    model_file = f'connect4_model_iteration_{iteration}.keras'
-    
-    if os.path.exists(model_file):
-        new_model = tf.keras.models.load_model(model_file)
-        print("using an existing file")
-    else:
-        new_model = Connect4NN(6, 7).model
-        print("no existing model. loading new one")
+def main():
+    initial_tau = 2
+    final_tau = 0.5
+    num_iterations = 10
+    training_log = []
 
-    mcts = MCTS(new_model, 400)
+    for iteration in range(num_iterations):
+        print(f"\nStarting iteration {iteration + 1}/{num_iterations}")
+        
+        # Load or create model
+        model_file = f'connect4_model_iteration_{iteration}.keras'
+        if os.path.exists(model_file):
+            model = tf.keras.models.load_model(model_file)
+            print("Loaded existing model")
+        else:
+            model = Connect4NN(6, 7).model
+            print("Created new model")
 
-    print(f"Iteration {iteration + 1}")
-    
-    tau = initial_tau - (iteration / 10) * (initial_tau - final_tau)
+        mcts = MCTS(model, 400)
+        tau = initial_tau - (iteration / num_iterations) * (initial_tau - final_tau)
 
-    # Self-play to generate new training data
-    training_data = self_play(mcts, tau=tau, num_games=100)
-    
-    # Prepare the data
-    states, policies, values = prepare_training_data(training_data)
-    
-    # Train the neural network
-    train_neural_network(new_model, states, policies, values, batch_size=32, epochs=10)
-    
-    # Optionally, save the model weights after each iteration
-    new_model.save(f'connect4_model_iteration_{iteration + 1}.keras')
+        # Generate training data
+        print("Generating training data...")
+        training_data, game_stats = self_play(mcts, tau=tau, num_games=100)
+        states, policies, values = prepare_training_data(training_data)
+
+        # Train the model
+        print("Training model...")
+        history = train_neural_network(model, states, policies, values, batch_size=32, epochs=10)
+
+        # Evaluate the model
+        print("Evaluating model...")
+        eval_results = evaluate_model(model, mcts)
+
+        # Log iteration results
+        iteration_log = {
+            "iteration": iteration + 1,
+            "training_games": game_stats,
+            "evaluation": eval_results,
+            "training_metrics": {
+                "policy_loss": history.history['policy_output_loss'][-1],
+                "value_loss": history.history['value_output_loss'][-1],
+                "policy_accuracy": history.history['policy_output_accuracy'][-1],
+                "value_mse": history.history['value_output_mse'][-1]
+            }
+        }
+        training_log.append(iteration_log)
+
+        # Save the model
+        model.save(f'connect4_model_iteration_{iteration + 1}.keras')
+        
+        # Save training log
+        with open('training_log.json', 'w') as f:
+            json.dump(training_log, f, indent=2)
+
+        print(f"\nIteration {iteration + 1} complete")
+        print(f"Training metrics: {iteration_log['training_metrics']}")
+        print(f"Evaluation results: {iteration_log['evaluation']}")
+
+if __name__ == "__main__":
+    main()
     
