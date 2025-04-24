@@ -8,6 +8,9 @@ import json
 import multiprocessing as mp
 from functools import partial
 
+# Enable unsafe deserialization for Lambda layers
+tf.keras.config.enable_unsafe_deserialization()
+
 # TODO: Create random state generation for varied starting states: pick a piece count randomly (0 - 42?) and make moves until the piece count is reached. If the game is over, undo the move and make another until a move cannot be made.
 
 def play_game(model, tau=1.0, batch_size=32, initial_state=None):
@@ -507,6 +510,9 @@ def main():
     num_iterations = 10
     games_per_iteration = 100  # Reduced from original
     training_log = []
+    
+    # Define evaluation games count
+    evaluation_games = 50  # This matches the default in evaluate_model()
 
     # If model exists, start from the last iteration
     start_iteration = 0
@@ -522,7 +528,24 @@ def main():
         # Load or create model
         model_file = f'connect4_model_iteration_{iteration}.keras'
         if os.path.exists(model_file):
-            model = tf.keras.models.load_model(model_file)
+            try:
+                # First try to load the model normally
+                model = tf.keras.models.load_model(model_file)
+            except (ValueError, NotImplementedError) as e:
+                # If we get any error, create a fresh model and load weights
+                print(f"Error loading model: {str(e)}")
+                print("Creating fresh model and loading weights instead...")
+                
+                # Create a new model with the same architecture
+                fresh_model = Connect4NN(6, 7).model
+                
+                # Try to load weights
+                try:
+                    fresh_model.load_weights(model_file)
+                    model = fresh_model
+                except:
+                    print("Could not load weights, using fresh model")
+                    model = fresh_model
             print(f"Loaded existing model from iteration {iteration}")
             
             # Ensure the model is compiled properly
@@ -582,7 +605,7 @@ def main():
 
         # Evaluate the model
         print("Evaluating model...")
-        eval_results = evaluate_model(model)
+        eval_results = evaluate_model(model, num_games=evaluation_games)
 
         # Log iteration results
         iteration_log = {
@@ -610,8 +633,8 @@ def main():
         print(f"Evaluation results: {iteration_log['evaluation']}")
         
         # Break early if we achieve good balance (optional)
-        if (0.35 <= eval_results["red_wins"]/num_games <= 0.65 and 
-            0.35 <= eval_results["yellow_wins"]/num_games <= 0.65 and
+        if (0.35 <= eval_results["red_wins"]/evaluation_games <= 0.65 and 
+            0.35 <= eval_results["yellow_wins"]/evaluation_games <= 0.65 and
             eval_results["draws"] > 0):
             print("Model has achieved good balance of red/yellow wins and draws!")
 

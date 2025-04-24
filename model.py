@@ -57,8 +57,11 @@ class Connect4NN:
         # Define the input layer - 3 channels
         input_layer = tf.keras.layers.Input(shape=(row_count, col_count, 3))
         
-        # Cast to float32 for consistent precision - use Lambda instead of Cast
-        x = tf.keras.layers.Lambda(lambda x: tf.cast(x, dtype='float32'))(input_layer)
+        # Cast to float32 for consistent precision - use Lambda with explicit output shape
+        x = tf.keras.layers.Lambda(
+            lambda x: tf.cast(x, dtype='float32'),
+            output_shape=lambda input_shape: input_shape  # Explicitly define output shape
+        )(input_layer)
         
         # Initial convolutional layer
         x = tf.keras.layers.Conv2D(128, kernel_size=3, padding='same')(x)
