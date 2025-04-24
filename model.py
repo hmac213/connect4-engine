@@ -78,16 +78,16 @@ class Connect4NN:
         policy_head = tf.keras.layers.Conv2D(64, kernel_size=3, padding='same')(x)  # Increased from 32 to 64 filters
         policy_head = tf.keras.layers.BatchNormalization()(policy_head)
         policy_head = tf.keras.layers.ReLU()(policy_head)
-        # Reduced dropout to allow sharper learning
-        policy_head = tf.keras.layers.SpatialDropout2D(0.15)(policy_head)
+        # Reduce dropout from 0.15 to 0.1 to allow sharper policy learning
+        policy_head = tf.keras.layers.SpatialDropout2D(0.1)(policy_head)
         policy_head = tf.keras.layers.Conv2D(1, kernel_size=1)(policy_head)
         policy_head = tf.keras.layers.Flatten()(policy_head)
-        # Add L2 regularization to policy output but reduce strength
+        # Reduce L2 regularization strength
         policy_head = tf.keras.layers.Dense(
             7, 
             activation='softmax', 
             name='policy_output',
-            kernel_regularizer=tf.keras.regularizers.l2(0.0005)  # Reduced from 0.001
+            kernel_regularizer=tf.keras.regularizers.l2(0.0002)  # Reduced from 0.0005
         )(policy_head)
 
         # Simplified value head with more regularization
@@ -120,11 +120,11 @@ class Connect4NN:
         self.model.compile(
             optimizer=optimizer,
             loss={
-                'policy_output': tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.05),
+                'policy_output': tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.03),  # Reduced from 0.05
                 'value_output': 'mean_squared_error'
             },
             loss_weights={
-                'policy_output': 1.0,
+                'policy_output': 1.5,  # Increased from 1.0 to prioritize policy learning
                 'value_output': 1.0
             },
             metrics={

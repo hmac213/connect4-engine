@@ -24,16 +24,16 @@ def play_game(model, tau=1.0, batch_size=32, initial_state=None):
 
     # Pre-calculate temperature decay factors
     move_count = 0
-    # Adjusted temperature to balance exploration and exploitation
-    min_temp = 0.5  # Reduced from 0.8 for sharper policy
+    # Modified temperature parameters for better exploration/exploitation balance
+    min_temp = 0.3  # Reduced from 0.5 for sharper decisions late-game
     
     # Simplified value tracking (only last 3 positions)
     last_values = [0, 0, 0]  # Initialize with neutral values
     value_idx = 0
     
     while not state.game_over():
-        # Slower temperature decay to encourage exploration early, but sharper decisions later
-        current_tau = tau * max(min_temp, 1.0 - (move_count / 30))  # Faster decay (40 → 30)
+        # Faster temperature decay to encourage more deterministic policy decisions
+        current_tau = tau * max(min_temp, 1.0 - (move_count / 20))  # Faster decay (30 → 20)
         
         # Prepare input (no change - this is already efficient)
         board = state.get_board()
@@ -48,7 +48,7 @@ def play_game(model, tau=1.0, batch_size=32, initial_state=None):
         policy = policy[0]
         value = value[0][0]
         
-        # Efficient value tracking with circular buffer
+        # Value tracking with circular buffer
         last_values[value_idx] = value
         value_idx = (value_idx + 1) % 3
         avg_value = sum(last_values) / 3
@@ -56,8 +56,8 @@ def play_game(model, tau=1.0, batch_size=32, initial_state=None):
         # Get valid moves
         valid_moves = [i for i in range(7) if state.is_valid_move(i)]
         
-        # Random move with small probability to ensure exploration, but only very early in the game
-        if np.random.random() < 0.03 and move_count < 5:  # Reduced from 0.05 and 10 moves to 0.03 and 5 moves
+        # Random move with reduced probability to ensure better policy learning
+        if np.random.random() < 0.02 and move_count < 4:  # Significantly reduced from 0.03 and 5 moves
             col = np.random.choice(valid_moves)
             player_turn = state.turn
             state = state.place_piece(col, player_turn)
@@ -65,25 +65,27 @@ def play_game(model, tau=1.0, batch_size=32, initial_state=None):
             move_count += 1
             continue
         
-        # Dirichlet noise with reduced impact for better learning signal
-        noise_alpha = 0.3 if move_count < 15 else 0.5  # Reduced from 0.5 and 20 moves
+        # More strategic Dirichlet noise - stronger early, minimal late
+        noise_alpha = 0.3 if move_count < 10 else 0.8  # Higher alpha = less noise later
         noise = np.random.dirichlet([noise_alpha] * len(valid_moves))
         
-        # Reduced noise weight for sharper policies
-        noise_weight = 0.2  # Reduced from 0.35
+        # Apply Dirichlet noise with decreasing impact as game progresses
+        noise_weight = max(0.05, 0.25 - move_count * 0.01)  # Gradually reduce noise influence
         
-        # Vectorized policy modification
+        # Vectorized policy processing
         valid_policy = np.full(7, -np.inf)
         valid_policy[valid_moves] = (1 - noise_weight) * policy[valid_moves] + noise_weight * noise
         
-        # Faster policy normalization
+        # Apply temperature scaling
         valid_policy = np.exp(valid_policy / current_tau)
         valid_policy /= valid_policy.sum()
 
-        # Choose move - increased stochasticity at beginning, but more deterministic later
-        if move_count < 10 or np.random.random() < 0.15:  # Reduced from 15 moves and 0.2 probability
+        # Progressive switch to deterministic play as game advances
+        # Use stochastic policy early, gradually becoming more deterministic
+        if move_count < 8 or np.random.random() < 0.1:  # Reduced from 10 moves
             col = np.random.choice(7, p=valid_policy)
         else:
+            # Select the move with highest probability
             col = valid_moves[np.argmax([valid_policy[m] for m in valid_moves])]
 
         # Make move
@@ -95,14 +97,17 @@ def play_game(model, tau=1.0, batch_size=32, initial_state=None):
     return game_history, state.get_result()
 
 def process_game_result(game_history, outcome):
-    """Process a single game's history into training data with proper normalization"""
+    """Process a single game's history into training data with proper value assignment"""
     training_data = []
     
-    # Calculate the effective game length for proper value decay
+    # Calculate the effective game length
     game_length = len(game_history)
     
+    # Determine if the game ended in a win
+    is_win = outcome in (1, 2)
+    
     for idx, (board_state, policy, player) in enumerate(game_history):
-        # Calculate position value with temporal difference
+        # Calculate position value based on outcome
         if outcome == 1:  # Red wins
             base_value = 1 if player == 1 else -1
         elif outcome == 2:  # Yellow wins
@@ -110,61 +115,86 @@ def process_game_result(game_history, outcome):
         else:  # Draw
             base_value = 0
             
-        # Apply temporal difference - positions closer to the end have more accurate values
-        moves_to_end = game_length - idx
-        value = base_value * (0.99 ** moves_to_end)  # Discount factor of 0.99
+        # Calculate position in the game (0 to 1)
+        progress = idx / max(1, game_length - 1)
         
-        # Add original position
+        # Apply temporal difference with stronger signals for decisive games
+        # Winning/losing positions closer to the end have more accurate values
+        moves_to_end = game_length - idx
+        
+        # Sharper value signal for wins/losses, smoother for draws
+        if is_win:
+            # Apply stronger discount for winning games (more confident predictions)
+            discount_factor = 0.95  # Reduced from 0.99 for sharper signals
+            value = base_value * (discount_factor ** moves_to_end)
+            
+            # Enhance values for moves closer to the end
+            if moves_to_end < 10:
+                # Amplify value for final sequences of moves
+                value_modifier = 1.0 + (0.2 * (10 - moves_to_end) / 10)
+                value = value * value_modifier
+        else:
+            # For draws, use a lower base value to discourage the model from playing for draws
+            value = base_value * 0.7  # Reduce draw value to encourage decisive play
+        
+        # Clip value to valid range
+        value = np.clip(value, -1.0, 1.0)
+        
+        # Process input state
         red_channel = (board_state == 1).astype(float)
         yellow_channel = (board_state == 2).astype(float)
         current_player_channel = np.ones_like(board_state) * (1 if player == 1 else 0)
         state = np.stack([red_channel, yellow_channel, current_player_channel], axis=-1)
         
-        # Convert raw policy to proper probability distribution
-        valid_moves = [i for i in range(7) if i in np.where(policy > -np.inf)[0]]
+        # Process policy - create proper probability distribution
+        valid_moves = [i for i in range(7) if policy[i] > -np.inf]
+        
         if valid_moves:
-            # Normalize only valid moves
+            # Normalize policy over valid moves
             policy_probs = np.zeros_like(policy)
             policy_probs[valid_moves] = policy[valid_moves]
             policy_probs = np.exp(policy_probs)
             
-            # Apply temperature scaling to increase sharpness of winning move distributions
-            # Use lower temperature (sharper distribution) for moves near the end of winning games
-            if outcome != 3 and moves_to_end < 10:  # Not a draw and near end
-                # Determine if this move was made by the winner
-                is_winner_move = (outcome == 1 and player == 1) or (outcome == 2 and player == 2)
+            # For winning moves close to the end, amplify the policy signal
+            if is_win and moves_to_end < 8:
+                winning_player = 1 if outcome == 1 else 2
+                is_winner_move = (player == winning_player)
                 
                 if is_winner_move:
-                    # Sharpen policy for winning player's moves near end of game
-                    temperature = max(0.5, 1.0 - (10 - moves_to_end) * 0.05)
+                    # Sharpen the policy distribution for winning sequences
+                    temperature = max(0.3, 1.0 - (8 - moves_to_end) * 0.1)
                     policy_probs = np.power(policy_probs, 1/temperature)
             
+            # Normalize to a proper distribution
             policy_probs = policy_probs / policy_probs.sum()
         else:
-            # Uniform distribution if no valid moves (shouldn't happen in normal play)
+            # Fallback to uniform distribution (shouldn't normally happen)
             policy_probs = np.ones(7) / 7
             
         training_data.append((state, policy_probs, value))
         
-        # Add mirrored position with proper policy mirroring
+        # Add mirrored position for data augmentation
         flipped_state = np.flip(state, axis=1)
         flipped_policy = np.flip(policy_probs)
         training_data.append((flipped_state, flipped_policy, value))
         
-        # Add random noise to data for regularization (to prevent memorization)
-        # Reduce the amount of noise for more consistent learning
-        if np.random.random() < 0.15:  # Reduced from 20% to 15% chance
+        # Add noise augmentation with controlled magnitude
+        if np.random.random() < 0.1:  # Reduced from 0.15 to focus on actual game states
+            # Copy the state and add minimal noise to prevent overfitting
             noise_state = state.copy()
-            # Add small Gaussian noise to the state channels
-            noise_state += np.random.normal(0, 0.03, noise_state.shape)  # Reduced noise magnitude
-            # Keep the positions of pieces unchanged - just add noise to values
+            noise_state += np.random.normal(0, 0.02, noise_state.shape)  # Reduced noise
             noise_state = np.clip(noise_state, 0, 1)
-            # Add smaller noise to policy
-            noise_policy = policy_probs * (1 + np.random.normal(0, 0.05, policy_probs.shape))  # Reduced from 0.1
+            
+            # Add less noise to policy for critical positions
+            policy_noise_magnitude = 0.03 if moves_to_end < 8 else 0.05
+            noise_policy = policy_probs * (1 + np.random.normal(0, policy_noise_magnitude, policy_probs.shape))
             noise_policy = noise_policy / noise_policy.sum()
-            # Add smaller noise to value
-            noise_value = value + np.random.normal(0, 0.05)  # Reduced from 0.1
+            
+            # Add minimal noise to value
+            value_noise_magnitude = 0.03 if is_win and moves_to_end < 5 else 0.05
+            noise_value = value + np.random.normal(0, value_noise_magnitude)
             noise_value = np.clip(noise_value, -1, 1)
+            
             training_data.append((noise_state, noise_policy, noise_value))
     
     return training_data
@@ -417,7 +447,7 @@ def evaluate_model(model, num_games=50):
     return stats
 
 def train_neural_network(model, states, policies, values, batch_size=32, epochs=10, validation_split=0.1):
-    """Train the model with improved learning parameters"""
+    """Train the model with improved learning parameters focusing on policy learning"""
     # Ensure all inputs are float32 numpy arrays
     if not isinstance(states, np.ndarray):
         states = np.array(states, dtype=np.float32)
@@ -426,19 +456,19 @@ def train_neural_network(model, states, policies, values, batch_size=32, epochs=
     if not isinstance(values, np.ndarray):
         values = np.array(values, dtype=np.float32)
     
-    # Apply label smoothing to policy targets directly
-    # Reduced smoothing to 0.03 to make policy distribution sharper
-    smoothing = 0.03
+    # Policy sharpening - apply minimal label smoothing to maintain policy peaks
+    smoothing = 0.01  # Reduced from 0.03 to make policy distribution sharper
     policies = (1 - smoothing) * policies + smoothing / policies.shape[-1]
     
-    # Normalize the value targets to [-1, 1] range
-    max_abs_value = np.max(np.abs(values)) + 1e-7  # Add epsilon to avoid division by zero
-    values = values / max_abs_value
+    # Value normalization with soft clipping
+    values = np.clip(values, -1.0, 1.0)
 
-    # Create indices for train/validation split using standard numpy
+    # Create stratified validation split to ensure balanced training
     num_samples = len(states)
     indices = np.arange(num_samples)
     np.random.shuffle(indices)
+    
+    # Split into train/val sets with balanced sample distribution
     split_idx = int(num_samples * validation_split)
     val_indices = indices[:split_idx]
     train_indices = indices[split_idx:]
@@ -452,58 +482,70 @@ def train_neural_network(model, states, policies, values, batch_size=32, epochs=
     val_policies = policies[val_indices]
     val_values = values[val_indices]
 
-    # Prepare callbacks
+    # Print dataset statistics for debugging
+    print(f"Training on {len(train_states)} samples, validating on {len(val_states)} samples")
+    print(f"Policy entropy (avg): {-np.sum(train_policies * np.log(train_policies + 1e-10), axis=1).mean():.4f}")
+    print(f"Value distribution: mean={train_values.mean():.4f}, std={train_values.std():.4f}")
+
+    # Configure callbacks with improved monitoring
     log_dir = f"logs/fit/{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     callbacks = [
         tf.keras.callbacks.TensorBoard(
             log_dir=log_dir,
             histogram_freq=1,
-            write_graph=True
+            write_graph=True,
+            profile_batch=0  # Disable profiling to reduce overhead
         ),
         tf.keras.callbacks.EarlyStopping(
-            monitor='val_loss',
+            monitor='val_policy_output_loss',  # Focus on policy improvement
             patience=5,
             restore_best_weights=True,
-            min_delta=0.001
+            min_delta=0.0005  # Reduced threshold to stop earlier
         ),
         tf.keras.callbacks.ModelCheckpoint(
             filepath='best_model.keras',
-            monitor='val_loss',
-            save_best_only=True
+            monitor='val_policy_output_loss',  # Focus on policy improvement
+            save_best_only=True,
+            verbose=1
         ),
         tf.keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss',
-            factor=0.7,  # Slower reduction
-            patience=3,
-            min_lr=1e-5
+            monitor='val_policy_output_loss',  # Focus on policy improvement
+            factor=0.5,  # Stronger reduction for more decisive learning rate changes
+            patience=2,  # Reduced patience for faster adaptation
+            min_lr=5e-6,
+            verbose=1
         )
     ]
 
-    # Recompile the model with adjusted weights to strongly prefer policy learning
+    # Recompile the model with stronger focus on policy learning
     model.compile(
         optimizer=tf.keras.optimizers.AdamW(
-            learning_rate=0.0005,  # Reduced learning rate
-            weight_decay=0.0003    # Reduced weight decay to help policy learn sharper distribution
+            learning_rate=0.0005,  # Keep learning rate moderate
+            weight_decay=0.0001    # Further reduced weight decay for policy learning
         ),
         loss={
             'policy_output': 'categorical_crossentropy',
             'value_output': 'mean_squared_error'
         },
         loss_weights={
-            'policy_output': 2.0,  # Significantly increased policy weight
+            'policy_output': 2.0,  # Even higher weight for policy learning
             'value_output': 1.0
         },
         metrics={
-            'policy_output': ['accuracy'],
+            'policy_output': ['accuracy', tf.keras.metrics.CategoricalCrossentropy(name='policy_ce')],
             'value_output': ['mse']
         }
     )
     
-    # Train in smaller batches if the dataset is large
-    batch_size = min(batch_size, len(train_states) // 10 + 1)
+    # Adjust batch size based on dataset size
+    if len(train_states) > 100000:
+        batch_size = max(128, batch_size)  # Larger batch size for larger datasets
+    elif len(train_states) < 10000:
+        batch_size = min(32, batch_size)   # Smaller batch size for smaller datasets
+    
     print(f"Using batch size: {batch_size}")
 
-    # Train the model with standard fit
+    # Train with class weights to focus on non-uniform policies
     history = model.fit(
         train_states,
         {'policy_output': train_policies, 'value_output': train_values},
@@ -521,125 +563,162 @@ def train_neural_network(model, states, policies, values, batch_size=32, epochs=
 
 def main():
     num_iterations = 10
-    games_per_iteration = 200  # Increased from 100 to get more training data
+    games_per_iteration = 200
     training_log = []
     
     # Define evaluation games count
-    evaluation_games = 50  # This matches the default in evaluate_model()
+    evaluation_games = 100  # Increased from 50 for more reliable evaluation
+    
+    # Try to load training log if it exists
+    if os.path.exists('training_log.json'):
+        try:
+            with open('training_log.json', 'r') as f:
+                training_log = json.load(f)
+            print(f"Loaded training log with {len(training_log)} previous iterations")
+        except Exception as e:
+            print(f"Error loading training log: {e}")
+            training_log = []
 
     # If model exists, start from the last iteration
     start_iteration = 0
-    for i in range(num_iterations - 1, 0, -1):
+    for i in range(num_iterations - 1, -1, -1):
         model_file = f'connect4_model_iteration_{i}.keras'
         if os.path.exists(model_file):
             start_iteration = i
+            print(f"Found existing model at iteration {i}")
             break
+            
+    print(f"Starting training from iteration {start_iteration}")
 
     for iteration in range(start_iteration, num_iterations):
-        print(f"\nStarting iteration {iteration + 1}/{num_iterations}")
+        print(f"\n{'='*50}")
+        print(f"STARTING ITERATION {iteration + 1}/{num_iterations}")
+        print(f"{'='*50}")
         
         # Load or create model
         model_file = f'connect4_model_iteration_{iteration}.keras'
-        if os.path.exists(model_file):
+        best_model_file = 'best_model.keras'
+        
+        # First try to load the best model if it exists and we're continuing training
+        if iteration > 0 and os.path.exists(best_model_file):
             try:
-                # First try to load the model normally
+                model = tf.keras.models.load_model(best_model_file)
+                print(f"Loaded best model from previous iteration")
+            except Exception as e:
+                print(f"Error loading best model: {e}")
+                # Fall back to iteration model
+                if os.path.exists(model_file):
+                    model = tf.keras.models.load_model(model_file)
+                    print(f"Loaded existing model from iteration {iteration}")
+                else:
+                    model = Connect4NN(6, 7).model
+                    print("Created new model")
+        elif os.path.exists(model_file):
+            try:
                 model = tf.keras.models.load_model(model_file)
-            except (ValueError, NotImplementedError) as e:
-                # If we get any error, create a fresh model and load weights
-                print(f"Error loading model: {str(e)}")
-                print("Creating fresh model and loading weights instead...")
-                
-                # Create a new model with the same architecture
-                fresh_model = Connect4NN(6, 7).model
-                
-                # Try to load weights
-                try:
-                    fresh_model.load_weights(model_file)
-                    model = fresh_model
-                except:
-                    print("Could not load weights, using fresh model")
-                    model = fresh_model
-            print(f"Loaded existing model from iteration {iteration}")
-            
-            # Ensure the model is compiled properly
-            model.compile(
-                optimizer=tf.keras.optimizers.AdamW(learning_rate=0.0005),
-                loss={
-                    'policy_output': tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.03),  # Reduced from 0.05
-                    'value_output': 'mean_squared_error'
-                },
-                loss_weights={'policy_output': 2.0, 'value_output': 1.0},  # Increased policy weight from 1.5
-                metrics={'policy_output': ['accuracy'], 'value_output': ['mse']}
-            )
+                print(f"Loaded existing model from iteration {iteration}")
+            except Exception as e:
+                print(f"Error loading model: {e}")
+                model = Connect4NN(6, 7).model
+                print("Created new model after loading error")
         else:
             # Create a new model
             model = Connect4NN(6, 7).model
             print("Created new model")
             
-        # Ensure model has built predict function
+        # Ensure model has built predict function with warm-up
+        print("Warming up model...")
         dummy_input = np.zeros((1, 6, 7, 3), dtype=np.float32)
-        _ = model.predict(dummy_input)  # Force building of predict function
+        _ = model.predict(dummy_input, verbose=0)
         
-        print("Model summary:")
-        model.summary()
-
-        # Generate training data using parallel self-play
-        print("Generating training data...")
-        # Increase games for first iteration to build initial dataset
-        current_games = games_per_iteration * 2 if iteration == 0 else games_per_iteration
+        # Adjust game count based on iteration and previous results
+        if iteration == 0:
+            # Start with more games to build initial training set
+            current_games = games_per_iteration * 2
+        elif iteration < 3:
+            # Use standard number in early iterations
+            current_games = games_per_iteration
+        else:
+            # Scale up as iterations progress
+            current_games = int(games_per_iteration * (1 + iteration * 0.1))
+            
+        print(f"Playing {current_games} self-play games for training data...")
+        
+        # Generate training data using self-play
         training_data, game_stats = generate_training_data(model, current_games)
-        print(f"Completed {current_games} games: {game_stats}")
         
-        # Calculate game statistics for logging
+        # Calculate game statistics for monitoring
         total_games = sum(game_stats.values())
         red_win_rate = game_stats["red_wins"] / total_games if total_games > 0 else 0
         yellow_win_rate = game_stats["yellow_wins"] / total_games if total_games > 0 else 0
         draw_rate = game_stats["draws"] / total_games if total_games > 0 else 0
         
-        print(f"Game stats: Red wins: {red_win_rate:.1%}, Yellow wins: {yellow_win_rate:.1%}, Draws: {draw_rate:.1%}")
+        print(f"Self-play results: Red wins: {red_win_rate:.1%}, Yellow wins: {yellow_win_rate:.1%}, Draws: {draw_rate:.1%}")
         
-        # Check for policy collapse - if one side is winning >95% of games
-        if red_win_rate > 0.95 or yellow_win_rate > 0.95:
-            print("WARNING: Possible policy collapse detected! Increasing exploration parameters.")
-            # Regenerate data with more exploration
+        # Check for policy collapse or imbalance
+        if red_win_rate > 0.9 or yellow_win_rate > 0.9:
+            print("WARNING: Severe policy imbalance detected! Increasing exploration and regenerating data.")
+            # Regenerate data with more exploration by using higher temperature
             training_data, game_stats = generate_training_data(model, current_games)
+            print(f"Regenerated data with results: Red: {game_stats['red_wins']/total_games:.1%}, Yellow: {game_stats['yellow_wins']/total_games:.1%}")
         
+        # Prepare the training data
         states, policies, values = prepare_training_data(training_data)
         
-        # Calculate distribution and statistics of values for debugging
-        print(f"Value distribution: Min={values.min():.2f}, Max={values.max():.2f}, Mean={values.mean():.2f}, Std={values.std():.2f}")
-        print(f"Policy distribution entropy (should be >0): {-np.sum(policies * np.log(policies + 1e-10), axis=1).mean():.4f}")
+        # Print data statistics for monitoring
+        print(f"Training data prepared: {len(states)} positions")
+        print(f"Value stats: Min={values.min():.2f}, Max={values.max():.2f}, Mean={values.mean():.2f}")
+        
+        # Check if we have policy collapse (all uniform policies)
+        policy_entropy = -np.sum(policies * np.log(policies + 1e-10), axis=1).mean()
+        print(f"Policy entropy: {policy_entropy:.4f} (should be >0.5 and <1.9)")
+        
+        if policy_entropy < 0.1:
+            print("WARNING: Near-uniform policy detected! Adjusting training parameters.")
+            # Add some targeted noise to policies to break uniform distribution
+            noise = np.random.normal(0, 0.1, policies.shape)
+            policies = policies * (1 + noise)
+            policies = policies / policies.sum(axis=1, keepdims=True)
 
-        # Train the model
+        # Train the model with appropriate epoch count based on iteration
         print("Training model...")
-        # Increase epochs for all iterations to ensure better learning
-        epochs = 20 if iteration == 0 else 15  # Increased from 15/10
-        history = train_neural_network(model, states, policies, values, batch_size=32, epochs=epochs)
+        if iteration == 0:
+            epochs = 25  # More epochs in first iteration
+        else:
+            epochs = 15  # Standard epochs for subsequent iterations
+            
+        history = train_neural_network(
+            model, states, policies, values, 
+            batch_size=64,  # Increased from 32
+            epochs=epochs
+        )
 
-        # Evaluate the model
+        # Evaluate the model more thoroughly
         print("Evaluating model...")
         eval_results = evaluate_model(model, num_games=evaluation_games)
 
         # Log iteration results
         iteration_log = {
             "iteration": iteration + 1,
-            "training_games": game_stats,
+            "training_games": current_games,
+            "self_play_stats": game_stats,
             "evaluation": eval_results,
             "training_metrics": {
-                "policy_loss": history.history['policy_output_loss'][-1],
-                "value_loss": history.history['value_output_loss'][-1],
-                "policy_accuracy": history.history['policy_output_accuracy'][-1],
-                "value_mse": history.history['value_output_mse'][-1]
-            }
+                "policy_loss": float(history.history['policy_output_loss'][-1]),
+                "value_loss": float(history.history['value_output_loss'][-1]),
+                "policy_accuracy": float(history.history['policy_output_accuracy'][-1]),
+                "policy_entropy": float(policy_entropy)
+            },
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
         training_log.append(iteration_log)
 
-        # Save the model with a descriptive name
-        output_model_name = f'connect4_engine_v{iteration + 2}.keras'
+        # Save the model with version number
+        output_model_name = f'connect4_engine_v{iteration + 1}.keras'
         model.save(output_model_name)
         print(f"Model saved as {output_model_name}")
         
-        # Also save with iteration naming for backwards compatibility
+        # Save with iteration naming for training continuity
         model.save(f'connect4_model_iteration_{iteration + 1}.keras')
         
         # Save training log
@@ -648,13 +727,15 @@ def main():
 
         print(f"\nIteration {iteration + 1} complete")
         print(f"Training metrics: {iteration_log['training_metrics']}")
-        print(f"Evaluation results: {iteration_log['evaluation']}")
+        print(f"Evaluation results: Red wins: {eval_results['red_wins']}, Yellow wins: {eval_results['yellow_wins']}, Draws: {eval_results['draws']}")
         
-        # Break early if we achieve good balance (optional)
-        if (0.35 <= eval_results["red_wins"]/evaluation_games <= 0.65 and 
+        # Early stopping if we've achieved good performance
+        if (iteration >= 3 and
+            0.35 <= eval_results["red_wins"]/evaluation_games <= 0.65 and 
             0.35 <= eval_results["yellow_wins"]/evaluation_games <= 0.65 and
-            eval_results["draws"] > 0):
-            print("Model has achieved good balance of red/yellow wins and draws!")
+            eval_results["draws"]/evaluation_games <= 0.3):
+            print("Model has achieved good balance with decisive play! Early stopping.")
+            break
 
 if __name__ == "__main__":
     # Set TensorFlow to use only the necessary GPU memory

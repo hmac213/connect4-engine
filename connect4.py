@@ -16,6 +16,10 @@ class Connect4:
         return self.board
 
     def is_valid_move(self, col):
+        # First check if column is in bounds
+        if col < 0 or col >= self.col_count:
+            return False
+        # Then check if the top cell in the column is empty
         return self.board[self.row_count - 1][col] == 0
     
     def legal_moves(self):
