@@ -1,7 +1,7 @@
 import tensorflow as tf
+import numpy as np
 
-tf.keras.mixed_precision.set_global_policy('mixed_float16')
-
+# Configure GPU memory growth
 gpus = tf.config.experimental.list_physical_devices('GPU')
 if gpus:
     try:
@@ -9,6 +9,9 @@ if gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
     except RuntimeError as e:
         print(e)
+
+# Set mixed precision policy after GPU configuration
+tf.keras.mixed_precision.set_global_policy('mixed_float16')
 
 def squeeze_excite_block(input_tensor, ratio=16):
     """Squeeze and Excitation block for channel attention"""

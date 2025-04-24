@@ -1,7 +1,5 @@
 import numpy as np
 import random
-import tensorflow as tf
-print("Num GPUs Available: ", len(tf.config.list_physical_devices('GPU')))
 
 class Connect4:
     # 1 is red
