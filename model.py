@@ -22,7 +22,15 @@ def squeeze_excite_block(input_tensor, ratio=16):
     
     return tf.keras.layers.multiply([input_tensor, se])
 
-def residual_block(input_tensor, filters=256, kernel_size=3):
+def residual_block(input_tensor, filters=128, kernel_size=3):
+    """Residual block with proper projection shortcut"""
+    # Projection shortcut if dimensions don't match
+    if input_tensor.shape[-1] != filters:
+        shortcut = tf.keras.layers.Conv2D(filters, kernel_size=1, padding='same')(input_tensor)
+        shortcut = tf.keras.layers.BatchNormalization()(shortcut)
+    else:
+        shortcut = input_tensor
+
     # First convolutional layer
     x = tf.keras.layers.Conv2D(filters, kernel_size=kernel_size, padding='same')(input_tensor)
     x = tf.keras.layers.BatchNormalization()(x)
@@ -33,69 +41,70 @@ def residual_block(input_tensor, filters=256, kernel_size=3):
     x = tf.keras.layers.BatchNormalization()(x)
     
     # Add skip connection
-    x = tf.keras.layers.Add()([x, input_tensor])
+    x = tf.keras.layers.Add()([x, shortcut])
     x = tf.keras.layers.ReLU()(x)
     
-    # Add squeeze and excitation
-    x = squeeze_excite_block(x)
+    # Add squeeze and excitation with reduced ratio
+    x = squeeze_excite_block(x, ratio=8)  # Reduced ratio for smaller networks
     
     return x
 
 class Connect4NN:
     def __init__(self, row_count, col_count):
-        # Define the input layer - now with 3 channels
+        # Define the input layer - 3 channels
         input_layer = tf.keras.layers.Input(shape=(row_count, col_count, 3))
         
-        # Initial convolutional layer with reduced filters
+        # Initial convolutional layer
         x = tf.keras.layers.Conv2D(128, kernel_size=3, padding='same')(input_layer)
         x = tf.keras.layers.BatchNormalization()(x)
         x = tf.keras.layers.ReLU()(x)
-        x = tf.keras.layers.Dropout(0.1)(x)
 
         # Add residual blocks with squeeze and excitation
-        # Using 8 blocks with reduced filters
-        for _ in range(8):
+        for _ in range(8):  # 8 blocks is sufficient for Connect4
             x = residual_block(x, filters=128)
             x = tf.keras.layers.Dropout(0.1)(x)
 
-        # Policy head with reduced parameters
-        policy_head = tf.keras.layers.Conv2D(64, kernel_size=3, padding='same')(x)
+        # Simplified policy head
+        policy_head = tf.keras.layers.Conv2D(32, kernel_size=3, padding='same')(x)
         policy_head = tf.keras.layers.BatchNormalization()(policy_head)
         policy_head = tf.keras.layers.ReLU()(policy_head)
-        policy_head = tf.keras.layers.Conv2D(32, kernel_size=3, padding='same')(policy_head)
-        policy_head = tf.keras.layers.BatchNormalization()(policy_head)
-        policy_head = tf.keras.layers.ReLU()(policy_head)
-        policy_head = tf.keras.layers.Conv2D(2, kernel_size=1)(policy_head)
-        policy_head = tf.keras.layers.BatchNormalization()(policy_head)
-        policy_head = tf.keras.layers.ReLU()(policy_head)
+        policy_head = tf.keras.layers.Conv2D(1, kernel_size=1)(policy_head)
         policy_head = tf.keras.layers.Flatten()(policy_head)
-        policy_head = tf.keras.layers.Dense(64, activation='relu')(policy_head)
-        policy_head = tf.keras.layers.Dropout(0.2)(policy_head)
         policy_head = tf.keras.layers.Dense(7, activation='softmax', name='policy_output')(policy_head)
 
-        # Value head with reduced parameters
-        value_head = tf.keras.layers.Conv2D(64, kernel_size=3, padding='same')(x)
+        # Simplified value head
+        value_head = tf.keras.layers.Conv2D(32, kernel_size=3, padding='same')(x)
         value_head = tf.keras.layers.BatchNormalization()(value_head)
         value_head = tf.keras.layers.ReLU()(value_head)
-        value_head = tf.keras.layers.Conv2D(32, kernel_size=3, padding='same')(value_head)
-        value_head = tf.keras.layers.BatchNormalization()(value_head)
-        value_head = tf.keras.layers.ReLU()(value_head)
-        value_head = tf.keras.layers.Conv2D(1, kernel_size=1)(value_head)
-        value_head = tf.keras.layers.BatchNormalization()(value_head)
-        value_head = tf.keras.layers.ReLU()(value_head)
-        value_head = tf.keras.layers.Flatten()(value_head)
+        value_head = tf.keras.layers.GlobalAveragePooling2D()(value_head)
         value_head = tf.keras.layers.Dense(64, activation='relu')(value_head)
         value_head = tf.keras.layers.Dropout(0.2)(value_head)
-        value_head = tf.keras.layers.Dense(32, activation='relu')(value_head)
         value_head = tf.keras.layers.Dense(1, activation='tanh', name='value_output')(value_head)
 
         # Define the model
         self.model = tf.keras.models.Model(inputs=input_layer, outputs=[policy_head, value_head])
 
-        # Compile the model with AdamW optimizer
-        optimizer = tf.keras.optimizers.AdamW(learning_rate=0.002, weight_decay=0.0001)
+        # Compile with lower initial learning rate
+        optimizer = tf.keras.optimizers.AdamW(
+            learning_rate=0.001,
+            weight_decay=0.0001,
+            beta_1=0.9,
+            beta_2=0.999,
+            epsilon=1e-7
+        )
+        
         self.model.compile(
             optimizer=optimizer,
-            loss={'policy_output': 'categorical_crossentropy', 'value_output': 'mean_squared_error'},
-            metrics={'policy_output': 'accuracy', 'value_output': 'mse'}
+            loss={
+                'policy_output': tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.1),
+                'value_output': 'mean_squared_error'
+            },
+            loss_weights={
+                'policy_output': 1.0,
+                'value_output': 1.0
+            },
+            metrics={
+                'policy_output': 'accuracy',
+                'value_output': 'mse'
+            }
         )
