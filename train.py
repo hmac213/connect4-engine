@@ -24,16 +24,16 @@ def play_game(model, tau=1.0, batch_size=32, initial_state=None):
 
     # Pre-calculate temperature decay factors
     move_count = 0
-    # Higher minimum temperature to ensure exploration
-    min_temp = 0.8
+    # Adjusted temperature to balance exploration and exploitation
+    min_temp = 0.5  # Reduced from 0.8 for sharper policy
     
     # Simplified value tracking (only last 3 positions)
     last_values = [0, 0, 0]  # Initialize with neutral values
     value_idx = 0
     
     while not state.game_over():
-        # Slower temperature decay to encourage exploration
-        current_tau = tau * max(min_temp, 1.0 - (move_count / 40))
+        # Slower temperature decay to encourage exploration early, but sharper decisions later
+        current_tau = tau * max(min_temp, 1.0 - (move_count / 30))  # Faster decay (40 → 30)
         
         # Prepare input (no change - this is already efficient)
         board = state.get_board()
@@ -56,8 +56,8 @@ def play_game(model, tau=1.0, batch_size=32, initial_state=None):
         # Get valid moves
         valid_moves = [i for i in range(7) if state.is_valid_move(i)]
         
-        # Random move with small probability to ensure exploration
-        if np.random.random() < 0.05 and move_count < 10:
+        # Random move with small probability to ensure exploration, but only very early in the game
+        if np.random.random() < 0.03 and move_count < 5:  # Reduced from 0.05 and 10 moves to 0.03 and 5 moves
             col = np.random.choice(valid_moves)
             player_turn = state.turn
             state = state.place_piece(col, player_turn)
@@ -65,12 +65,12 @@ def play_game(model, tau=1.0, batch_size=32, initial_state=None):
             move_count += 1
             continue
         
-        # Increased Dirichlet noise alpha for more randomness
-        noise_alpha = 0.5 if move_count < 20 else 0.7
+        # Dirichlet noise with reduced impact for better learning signal
+        noise_alpha = 0.3 if move_count < 15 else 0.5  # Reduced from 0.5 and 20 moves
         noise = np.random.dirichlet([noise_alpha] * len(valid_moves))
         
-        # Increased noise weight to 35%
-        noise_weight = 0.35
+        # Reduced noise weight for sharper policies
+        noise_weight = 0.2  # Reduced from 0.35
         
         # Vectorized policy modification
         valid_policy = np.full(7, -np.inf)
@@ -80,8 +80,8 @@ def play_game(model, tau=1.0, batch_size=32, initial_state=None):
         valid_policy = np.exp(valid_policy / current_tau)
         valid_policy /= valid_policy.sum()
 
-        # Choose move - increased stochasticity at beginning
-        if move_count < 15 or np.random.random() < 0.2:
+        # Choose move - increased stochasticity at beginning, but more deterministic later
+        if move_count < 10 or np.random.random() < 0.15:  # Reduced from 15 moves and 0.2 probability
             col = np.random.choice(7, p=valid_policy)
         else:
             col = valid_moves[np.argmax([valid_policy[m] for m in valid_moves])]
@@ -127,6 +127,18 @@ def process_game_result(game_history, outcome):
             policy_probs = np.zeros_like(policy)
             policy_probs[valid_moves] = policy[valid_moves]
             policy_probs = np.exp(policy_probs)
+            
+            # Apply temperature scaling to increase sharpness of winning move distributions
+            # Use lower temperature (sharper distribution) for moves near the end of winning games
+            if outcome != 3 and moves_to_end < 10:  # Not a draw and near end
+                # Determine if this move was made by the winner
+                is_winner_move = (outcome == 1 and player == 1) or (outcome == 2 and player == 2)
+                
+                if is_winner_move:
+                    # Sharpen policy for winning player's moves near end of game
+                    temperature = max(0.5, 1.0 - (10 - moves_to_end) * 0.05)
+                    policy_probs = np.power(policy_probs, 1/temperature)
+            
             policy_probs = policy_probs / policy_probs.sum()
         else:
             # Uniform distribution if no valid moves (shouldn't happen in normal play)
@@ -140,17 +152,18 @@ def process_game_result(game_history, outcome):
         training_data.append((flipped_state, flipped_policy, value))
         
         # Add random noise to data for regularization (to prevent memorization)
-        if np.random.random() < 0.2:  # 20% chance
+        # Reduce the amount of noise for more consistent learning
+        if np.random.random() < 0.15:  # Reduced from 20% to 15% chance
             noise_state = state.copy()
             # Add small Gaussian noise to the state channels
-            noise_state += np.random.normal(0, 0.05, noise_state.shape)
+            noise_state += np.random.normal(0, 0.03, noise_state.shape)  # Reduced noise magnitude
             # Keep the positions of pieces unchanged - just add noise to values
             noise_state = np.clip(noise_state, 0, 1)
-            # Add small noise to policy
-            noise_policy = policy_probs * (1 + np.random.normal(0, 0.1, policy_probs.shape))
+            # Add smaller noise to policy
+            noise_policy = policy_probs * (1 + np.random.normal(0, 0.05, policy_probs.shape))  # Reduced from 0.1
             noise_policy = noise_policy / noise_policy.sum()
-            # Add small noise to value
-            noise_value = value + np.random.normal(0, 0.1)
+            # Add smaller noise to value
+            noise_value = value + np.random.normal(0, 0.05)  # Reduced from 0.1
             noise_value = np.clip(noise_value, -1, 1)
             training_data.append((noise_state, noise_policy, noise_value))
     
@@ -414,8 +427,8 @@ def train_neural_network(model, states, policies, values, batch_size=32, epochs=
         values = np.array(values, dtype=np.float32)
     
     # Apply label smoothing to policy targets directly
-    # Reduced smoothing to 0.05 to prevent overfitting but maintain distinction
-    smoothing = 0.05
+    # Reduced smoothing to 0.03 to make policy distribution sharper
+    smoothing = 0.03
     policies = (1 - smoothing) * policies + smoothing / policies.shape[-1]
     
     # Normalize the value targets to [-1, 1] range
@@ -466,18 +479,18 @@ def train_neural_network(model, states, policies, values, batch_size=32, epochs=
         )
     ]
 
-    # Recompile the model with adjusted weights to prefer policy learning
+    # Recompile the model with adjusted weights to strongly prefer policy learning
     model.compile(
         optimizer=tf.keras.optimizers.AdamW(
             learning_rate=0.0005,  # Reduced learning rate
-            weight_decay=0.0005    # Increased weight decay
+            weight_decay=0.0003    # Reduced weight decay to help policy learn sharper distribution
         ),
         loss={
             'policy_output': 'categorical_crossentropy',
             'value_output': 'mean_squared_error'
         },
         loss_weights={
-            'policy_output': 1.5,  # Increased policy weight
+            'policy_output': 2.0,  # Significantly increased policy weight
             'value_output': 1.0
         },
         metrics={
@@ -508,7 +521,7 @@ def train_neural_network(model, states, policies, values, batch_size=32, epochs=
 
 def main():
     num_iterations = 10
-    games_per_iteration = 100  # Reduced from original
+    games_per_iteration = 200  # Increased from 100 to get more training data
     training_log = []
     
     # Define evaluation games count
@@ -552,10 +565,10 @@ def main():
             model.compile(
                 optimizer=tf.keras.optimizers.AdamW(learning_rate=0.0005),
                 loss={
-                    'policy_output': tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.05),
+                    'policy_output': tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.03),  # Reduced from 0.05
                     'value_output': 'mean_squared_error'
                 },
-                loss_weights={'policy_output': 1.5, 'value_output': 1.0},
+                loss_weights={'policy_output': 2.0, 'value_output': 1.0},  # Increased policy weight from 1.5
                 metrics={'policy_output': ['accuracy'], 'value_output': ['mse']}
             )
         else:
@@ -599,8 +612,8 @@ def main():
 
         # Train the model
         print("Training model...")
-        # Increase epochs for first iterations to bootstrap learning
-        epochs = 15 if iteration == 0 else 10
+        # Increase epochs for all iterations to ensure better learning
+        epochs = 20 if iteration == 0 else 15  # Increased from 15/10
         history = train_neural_network(model, states, policies, values, batch_size=32, epochs=epochs)
 
         # Evaluate the model
@@ -621,7 +634,12 @@ def main():
         }
         training_log.append(iteration_log)
 
-        # Save the model
+        # Save the model with a descriptive name
+        output_model_name = f'connect4_engine_v{iteration + 2}.keras'
+        model.save(output_model_name)
+        print(f"Model saved as {output_model_name}")
+        
+        # Also save with iteration naming for backwards compatibility
         model.save(f'connect4_model_iteration_{iteration + 1}.keras')
         
         # Save training log

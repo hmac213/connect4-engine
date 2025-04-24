@@ -75,19 +75,19 @@ class Connect4NN:
             x = tf.keras.layers.Dropout(0.15)(x)
 
         # Simplified policy head with more regularization
-        policy_head = tf.keras.layers.Conv2D(32, kernel_size=3, padding='same')(x)
+        policy_head = tf.keras.layers.Conv2D(64, kernel_size=3, padding='same')(x)  # Increased from 32 to 64 filters
         policy_head = tf.keras.layers.BatchNormalization()(policy_head)
         policy_head = tf.keras.layers.ReLU()(policy_head)
-        # Add spatial dropout
-        policy_head = tf.keras.layers.SpatialDropout2D(0.2)(policy_head)
+        # Reduced dropout to allow sharper learning
+        policy_head = tf.keras.layers.SpatialDropout2D(0.15)(policy_head)
         policy_head = tf.keras.layers.Conv2D(1, kernel_size=1)(policy_head)
         policy_head = tf.keras.layers.Flatten()(policy_head)
-        # Add L2 regularization to policy output
+        # Add L2 regularization to policy output but reduce strength
         policy_head = tf.keras.layers.Dense(
             7, 
             activation='softmax', 
             name='policy_output',
-            kernel_regularizer=tf.keras.regularizers.l2(0.001)
+            kernel_regularizer=tf.keras.regularizers.l2(0.0005)  # Reduced from 0.001
         )(policy_head)
 
         # Simplified value head with more regularization
