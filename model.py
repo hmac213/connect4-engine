@@ -57,31 +57,49 @@ class Connect4NN:
         # Define the input layer - 3 channels
         input_layer = tf.keras.layers.Input(shape=(row_count, col_count, 3))
         
+        # Cast to float32 for consistent precision
+        x = tf.keras.layers.Cast('float32')(input_layer)
+        
         # Initial convolutional layer
-        x = tf.keras.layers.Conv2D(128, kernel_size=3, padding='same')(input_layer)
+        x = tf.keras.layers.Conv2D(128, kernel_size=3, padding='same')(x)
         x = tf.keras.layers.BatchNormalization()(x)
         x = tf.keras.layers.ReLU()(x)
 
         # Add residual blocks with squeeze and excitation
-        for _ in range(8):  # 8 blocks is sufficient for Connect4
+        for _ in range(6):  # Reduced from 8 to 6 to decrease capacity
             x = residual_block(x, filters=128)
-            x = tf.keras.layers.Dropout(0.1)(x)
+            # Increased dropout to 0.15 for better regularization
+            x = tf.keras.layers.Dropout(0.15)(x)
 
-        # Simplified policy head
+        # Simplified policy head with more regularization
         policy_head = tf.keras.layers.Conv2D(32, kernel_size=3, padding='same')(x)
         policy_head = tf.keras.layers.BatchNormalization()(policy_head)
         policy_head = tf.keras.layers.ReLU()(policy_head)
+        # Add spatial dropout
+        policy_head = tf.keras.layers.SpatialDropout2D(0.2)(policy_head)
         policy_head = tf.keras.layers.Conv2D(1, kernel_size=1)(policy_head)
         policy_head = tf.keras.layers.Flatten()(policy_head)
-        policy_head = tf.keras.layers.Dense(7, activation='softmax', name='policy_output')(policy_head)
+        # Add L2 regularization to policy output
+        policy_head = tf.keras.layers.Dense(
+            7, 
+            activation='softmax', 
+            name='policy_output',
+            kernel_regularizer=tf.keras.regularizers.l2(0.001)
+        )(policy_head)
 
-        # Simplified value head
+        # Simplified value head with more regularization
         value_head = tf.keras.layers.Conv2D(32, kernel_size=3, padding='same')(x)
         value_head = tf.keras.layers.BatchNormalization()(value_head)
         value_head = tf.keras.layers.ReLU()(value_head)
         value_head = tf.keras.layers.GlobalAveragePooling2D()(value_head)
-        value_head = tf.keras.layers.Dense(64, activation='relu')(value_head)
-        value_head = tf.keras.layers.Dropout(0.2)(value_head)
+        # Smaller dense layer to reduce parameters
+        value_head = tf.keras.layers.Dense(
+            32, 
+            activation='relu',
+            kernel_regularizer=tf.keras.regularizers.l2(0.001)
+        )(value_head)
+        # Increased dropout for regularization 
+        value_head = tf.keras.layers.Dropout(0.3)(value_head)
         value_head = tf.keras.layers.Dense(1, activation='tanh', name='value_output')(value_head)
 
         # Define the model
@@ -99,7 +117,7 @@ class Connect4NN:
         self.model.compile(
             optimizer=optimizer,
             loss={
-                'policy_output': tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.1),
+                'policy_output': tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.05),
                 'value_output': 'mean_squared_error'
             },
             loss_weights={
